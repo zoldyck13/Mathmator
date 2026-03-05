@@ -37,7 +37,7 @@ Before installing Mathmator, you need to have the Manim Community dependencies i
 
 **1. Clone the repository:**
 ```bash
-git https://github.com/zoldyck13/Mathmator.git
+git clone https://github.com/zoldyck13/Mathmator.git
 cd Mathmator
 ```
 
@@ -55,7 +55,7 @@ pip install -r requirements.txt
 **4. **Install** `llama-cpp-python` with **CUDA (For GPU Users)**:**
 If you have an NVIDIA GPU, run this to enable hardware acceleration:
 ```bash
-CMAKE_ARGS="-DLLAMA_CUBLAS=on" pip install llama-cpp-python --upgrade --force-reinstall --no-cache-dir
+CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --upgrade --force-reinstall --no-cache-dir
 ```
 
 **5. Download the Models:**
