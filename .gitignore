@@ -1,0 +1,31 @@
+# Python & Environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# Manim Output & Generated Files
+media/
+*.mp4
+latest_mathmator_code.py
+*_scene.py
+
+# AI Models & Weights (Too large for Git)
+*.gguf
+*.pt
+silero_v3_en.pt
+Meta-Llama-3-8B-Instruct-Q4_K_M.gguf
+mathmator_lora.gguf
+
+# Third-party Repositories / Build folders
+llama.cpp/
+
+# Backups & Old Executables
+mathmator_final_v*
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+mathmator_lora.gguf.zip

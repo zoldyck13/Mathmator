@@ -1,0 +1,8 @@
+typer
+manim
+llama-cpp-python
+SpeechRecognition
+openai-whisper
+torch
+torchaudio
+sounddevice
