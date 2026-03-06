@@ -1,6 +1,13 @@
+import os
+# CRITICAL: Prevent OpenMP thread conflicts between PyTorch and llama.cpp
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "4"
+os.environ["NUMEXPR_NUM_THREADS"] = "4"
+
 import typer
 import subprocess
-import os
 import shutil
 import re
 import speech_recognition as sr
@@ -8,42 +15,33 @@ import sys
 import torch
 import sounddevice as sd
 import zipfile
+import warnings
 from enum import Enum
 from llama_cpp import Llama
 
+# Suppress specific warnings from Whisper/Torch to keep output clean
+warnings.filterwarnings("ignore", message="Performing inference on CPU when CUDA is available")
+warnings.filterwarnings("ignore", message="FP16 is not supported on CPU; using FP32 instead")
+
+# Prevent PyTorch from hogging CPU threads
+torch.set_num_threads(4)
+
 app = typer.Typer()
 
+# --- MODEL PATHS & URLS ---
 BASE_MODEL_PATH = "./Meta-Llama-3-8B-Instruct-Q4_K_M.gguf"
+BASE_MODEL_URL = "https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf"
+
 LORA_PATH = "./mathmator_lora.gguf"
+LORA_ZIP_PATH = "./mathmator_lora.gguf.zip"
+LORA_ZIP_URL = "https://huggingface.co/Alisaadmotar/Mathmator-Llama3-LoRA/blob/main/mathmator_lora.gguf.zip"
+
+MERGED_MODEL_PATH = "./Mathmator-Model-Q4.gguf"
+MERGED_MODEL_ZIP_PATH = "./Mathmator-Model.gguf.zip"
+MERGED_MODEL_ZIP_URL = "https://huggingface.co/YOUR_USERNAME/YOUR_REPO_NAME/resolve/main/Mathmator-Model.gguf.zip"
+
 LATEST_CODE_FILE = "latest_mathmator_code.py"
 LAST_ERROR_LOG = ""  # Memory for the last crash
-
-BASE_MODEL_URL = "https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf"
-LORA_ZIP_URL = "https://huggingface.co/Alisaadmotar/Mathmator-Llama3-LoRA/resolve/main/mathmator_lora.gguf.zip"
-LORA_ZIP_PATH = "./mathmator_lora.gguf.zip"
-
-if not os.path.exists(BASE_MODEL_PATH):
-    typer.secho("Base model not found. Downloading Meta-Llama-3-8B-Instruct-Q4_K_M.gguf (~4.7GB)...", fg=typer.colors.YELLOW)
-    torch.hub.download_url_to_file(BASE_MODEL_URL, BASE_MODEL_PATH)
-
-if not os.path.exists(LORA_PATH):
-    if not os.path.exists(LORA_ZIP_PATH):
-        typer.secho("Mathmator LoRA adapter not found. Downloading mathmator_lora.gguf.zip...", fg=typer.colors.YELLOW)
-        try:
-            torch.hub.download_url_to_file(LORA_ZIP_URL, LORA_ZIP_PATH)
-        except Exception as e:
-            typer.secho(f"Failed to download LoRA ZIP: {e}", fg=typer.colors.RED)
-            sys.exit(1)
-            
-    typer.secho("Extracting mathmator_lora.gguf...", fg=typer.colors.CYAN)
-    try:
-        with zipfile.ZipFile(LORA_ZIP_PATH, 'r') as zip_ref:
-            zip_ref.extractall(".")
-        if os.path.exists(LORA_ZIP_PATH):
-            os.remove(LORA_ZIP_PATH)
-    except Exception as e:
-        typer.secho(f"Failed to extract LoRA: {e}", fg=typer.colors.RED)
-        sys.exit(1)
 
 class SuppressStderr:
     def __enter__(self):
@@ -63,23 +61,91 @@ def check_gpu():
     except Exception:
         return False
 
+# --- DYNAMIC HARDWARE DETECTION & DOWNLOAD LOGIC ---
 has_gpu = check_gpu()
+llm_kwargs = {}
 
 if has_gpu:
-    typer.secho("🤖 Mathmator: Running on GPU 🚀", fg=typer.colors.GREEN, bold=True)
+    typer.secho("🤖 Mathmator: GPU Detected! 🚀 (Using High-Speed Merged Model)", fg=typer.colors.GREEN, bold=True)
+    
+    # 1. Download/Extract Merged Model if missing
+    if not os.path.exists(MERGED_MODEL_PATH):
+        if not os.path.exists(MERGED_MODEL_ZIP_PATH):
+            typer.secho("Merged model not found. Downloading Mathmator-Model.gguf.zip...", fg=typer.colors.YELLOW)
+            try:
+                torch.hub.download_url_to_file(MERGED_MODEL_ZIP_URL, MERGED_MODEL_ZIP_PATH)
+            except Exception as e:
+                typer.secho(f"Download failed: {e}", fg=typer.colors.RED)
+                sys.exit(1)
+                
+        typer.secho("Extracting Mathmator-Model.gguf...", fg=typer.colors.CYAN)
+        try:
+            with zipfile.ZipFile(MERGED_MODEL_ZIP_PATH, 'r') as zip_ref:
+                zip_ref.extractall(".")
+            if os.path.exists(MERGED_MODEL_ZIP_PATH):
+                os.remove(MERGED_MODEL_ZIP_PATH)
+        except Exception as e:
+            typer.secho(f"Extraction failed: {e}", fg=typer.colors.RED)
+            sys.exit(1)
+            
+    # 2. Configure Llama for GPU (No LoRA parameter needed)
+    llm_kwargs = {
+        "model_path": MERGED_MODEL_PATH,
+        "n_ctx": 2048,                      # Full context since we have no LoRA split issues
+        "n_gpu_layers": -1,                 # 100% on GPU for max speed
+        "n_threads": 4,
+        "n_batch": 256,
+        "use_mmap": False,                  # CRITICAL for stability on Linux GPU
+        "verbose": False
+    }
+
 else:
-    typer.secho("🤖 Mathmator: Running on CPU 🐢", fg=typer.colors.YELLOW, bold=True)
+    typer.secho("🤖 Mathmator: CPU Detected! 🐢 (Using Base Model + LoRA Adapter)", fg=typer.colors.YELLOW, bold=True)
+    
+    # 1. Download Base Model if missing
+    if not os.path.exists(BASE_MODEL_PATH):
+        typer.secho("Base model not found. Downloading Meta-Llama-3-8B-Instruct-Q4_K_M.gguf...", fg=typer.colors.YELLOW)
+        torch.hub.download_url_to_file(BASE_MODEL_URL, BASE_MODEL_PATH)
 
+    # 2. Download/Extract LoRA if missing
+    if not os.path.exists(LORA_PATH):
+        if not os.path.exists(LORA_ZIP_PATH):
+            typer.secho("LoRA adapter not found. Downloading mathmator_lora.gguf.zip...", fg=typer.colors.YELLOW)
+            try:
+                torch.hub.download_url_to_file(LORA_ZIP_URL, LORA_ZIP_PATH)
+            except Exception as e:
+                typer.secho(f"Download failed: {e}", fg=typer.colors.RED)
+                sys.exit(1)
+                
+        typer.secho("Extracting mathmator_lora.gguf...", fg=typer.colors.CYAN)
+        try:
+            with zipfile.ZipFile(LORA_ZIP_PATH, 'r') as zip_ref:
+                zip_ref.extractall(".")
+            if os.path.exists(LORA_ZIP_PATH):
+                os.remove(LORA_ZIP_PATH)
+        except Exception as e:
+            typer.secho(f"Extraction failed: {e}", fg=typer.colors.RED)
+            sys.exit(1)
+            
+    # 3. Configure Llama for CPU (With LoRA parameter)
+    llm_kwargs = {
+        "model_path": BASE_MODEL_PATH,
+        "lora_path": LORA_PATH,
+        "n_ctx": 1024,                      # Strictly limited to prevent OS 'Killed'
+        "n_gpu_layers": 0,                  # 100% on CPU
+        "n_threads": 4,
+        "use_mmap": True,                   # CRITICAL for CPU: pages memory to disk to save RAM
+        "verbose": False
+    }
+
+# --- INITIALIZE THE ADAPTIVE MODEL ---
 with SuppressStderr():
-    llm = Llama(
-        model_path=BASE_MODEL_PATH, 
-        lora_path=LORA_PATH, 
-        n_ctx=2048, 
-        n_gpu_layers=-1 if has_gpu else 0,
-        verbose=False
-    )
+    llm = Llama(**llm_kwargs)
 
-device = torch.device('cuda' if has_gpu else 'cpu')
+
+# --- AUDIO MODELS ON CPU ---
+# Safely isolated on CPU to leave VRAM 100% for Llama
+device_audio = torch.device('cpu')
 model_file = 'silero_v3_en.pt'
 
 if not os.path.isfile(model_file):
@@ -89,7 +155,7 @@ if not os.path.isfile(model_file):
 try:
     with SuppressStderr():
         tts_model = torch.package.PackageImporter(model_file).load_pickle("tts_models", "model")
-        tts_model.to(device)
+        tts_model.to(device_audio)
 except Exception as e:
     typer.secho(f"Failed to load TTS model: {e}", fg=typer.colors.RED)
 
@@ -123,9 +189,9 @@ def listen_command():
         recognizer.adjust_for_ambient_noise(source, duration=0.5)
         try:
             audio = recognizer.listen(source, timeout=5, phrase_time_limit=15)
-            typer.secho("⏳ Processing speech with Offline Whisper...", fg=typer.colors.MAGENTA)
+            typer.secho("⏳ Processing speech with Offline Whisper on CPU...", fg=typer.colors.MAGENTA)
             
-            command = recognizer.recognize_whisper(audio, model="base.en").strip()
+            command = recognizer.recognize_whisper(audio, model="base.en", load_options={"device": "cpu"}, fp16=False).strip()
             command = re.sub(r'[^\w\s]', '', command).lower()
             
             typer.secho(f"🗣️ You said: {command}", fg=typer.colors.YELLOW)
@@ -198,7 +264,7 @@ def process_and_render(prompt_text: str, safe_topic_name: str, quality: Quality,
 
         output = llm(
             prompt_text, 
-            max_tokens=1500,       
+            max_tokens=700 if not has_gpu else 1500, # CPU gets smaller generation to save RAM, GPU gets full 
             stop=["<|end_of_text|>", "<|eot_id|>", "###", "```", "class Concept", "\nclass ", "\ndef ", "if __name__"], 
             temperature=0.1,   
             repeat_penalty=1.05,  
