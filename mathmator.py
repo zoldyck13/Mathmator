@@ -28,20 +28,31 @@ torch.set_num_threads(4)
 
 app = typer.Typer()
 
-# --- MODEL PATHS & URLS ---
+# --- MODEL PATHS & URLS (BASE + LORA ONLY) ---
 BASE_MODEL_PATH = "./Meta-Llama-3-8B-Instruct-Q4_K_M.gguf"
 BASE_MODEL_URL = "https://huggingface.co/QuantFactory/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf"
 
 LORA_PATH = "./mathmator_lora.gguf"
 LORA_ZIP_PATH = "./mathmator_lora.gguf.zip"
-LORA_ZIP_URL = "https://huggingface.co/Alisaadmotar/Mathmator-Llama3-LoRA/blob/main/mathmator_lora.gguf.zip"
-
-MERGED_MODEL_PATH = "./Mathmator-Model-Q4.gguf"
-MERGED_MODEL_ZIP_PATH = "./Mathmator-Model.gguf.zip"
-MERGED_MODEL_ZIP_URL = "https://huggingface.co/Alisaadmotar/Mathmator-Model-Q4/blob/main/Mathmator-Model-Q4.gguf.zip"
+LORA_ZIP_URL = "https://huggingface.co/Alisaadmotar/Mathmator-Llama3-LoRA/resolve/main/mathmator_lora.gguf.zip"
 
 LATEST_CODE_FILE = "latest_mathmator_code.py"
 LAST_ERROR_LOG = ""  # Memory for the last crash
+
+# --- 🛑 CRITICAL MANIM CE EXPLICIT RULES 🛑 ---
+MANIM_RULES = (
+    "\n--- CRITICAL MANIM CE 2024 SYNTAX ---\n"
+    "You MUST use Manim Community Edition syntax. Old ManimGL syntax will crash!\n"
+    "1. Background: `self.camera.background_color = BLACK`\n"
+    "2. Axes: `axes = Axes(x_range=[-10, 10, 1], y_range=[-5, 5, 1], x_length=10, y_length=6)`\n"
+    "3. Plotting: `graph = axes.plot(lambda x: np.sin(x), color=BLUE)`\n"
+    "4. Labels: `labels = axes.get_axis_labels(x_label='x', y_label='y')`\n"
+    "5. Title: `title = Title('Your Title Here')`\n"
+    "6. Animations: Use `Create()` instead of `ShowCreation()`.\n"
+    "7. Coordinates: ALL coordinates MUST be 3D arrays like `[x, y, 0]`. NEVER use 2D `[x, y]`! Example: `move_to([1, 2, 0])`\n"
+    "8. Keep loops short (max 3 iterations).\n"
+    "9. TEXT WRAPPING (CRITICAL): NEVER write long sentences in Text(). For long descriptions, ALWAYS use Paragraph('line1', 'line2', line_spacing=0.5) or use Text('...', font_size=20). If a sentence is more than 8 words, break it into multiple lines.\n"
+)
 
 class SuppressStderr:
     def __enter__(self):
@@ -62,81 +73,56 @@ def check_gpu():
         return False
 
 # --- DYNAMIC HARDWARE DETECTION & DOWNLOAD LOGIC ---
+# Download models if they don't exist
+if not os.path.exists(BASE_MODEL_PATH):
+    typer.secho("Base model not found. Downloading Meta-Llama-3-8B-Instruct-Q4_K_M.gguf...", fg=typer.colors.YELLOW)
+    torch.hub.download_url_to_file(BASE_MODEL_URL, BASE_MODEL_PATH)
+
+if not os.path.exists(LORA_PATH):
+    if not os.path.exists(LORA_ZIP_PATH):
+        typer.secho("LoRA adapter not found. Downloading mathmator_lora.gguf.zip...", fg=typer.colors.YELLOW)
+        try:
+            torch.hub.download_url_to_file(LORA_ZIP_URL, LORA_ZIP_PATH)
+        except Exception as e:
+            typer.secho(f"Download failed: {e}", fg=typer.colors.RED)
+            sys.exit(1)
+            
+    typer.secho("Extracting mathmator_lora.gguf...", fg=typer.colors.CYAN)
+    try:
+        with zipfile.ZipFile(LORA_ZIP_PATH, 'r') as zip_ref:
+            zip_ref.extractall(".")
+        if os.path.exists(LORA_ZIP_PATH):
+            os.remove(LORA_ZIP_PATH)
+    except Exception as e:
+        typer.secho(f"Extraction failed: {e}", fg=typer.colors.RED)
+        sys.exit(1)
+
+# Configure hardware settings dynamically
 has_gpu = check_gpu()
-llm_kwargs = {}
 
 if has_gpu:
-    typer.secho("🤖 Mathmator: GPU Detected! 🚀 (Using High-Speed Merged Model)", fg=typer.colors.GREEN, bold=True)
-    
-    # 1. Download/Extract Merged Model if missing
-    if not os.path.exists(MERGED_MODEL_PATH):
-        if not os.path.exists(MERGED_MODEL_ZIP_PATH):
-            typer.secho("Merged model not found. Downloading Mathmator-Model.gguf.zip...", fg=typer.colors.YELLOW)
-            try:
-                torch.hub.download_url_to_file(MERGED_MODEL_ZIP_URL, MERGED_MODEL_ZIP_PATH)
-            except Exception as e:
-                typer.secho(f"Download failed: {e}", fg=typer.colors.RED)
-                sys.exit(1)
-                
-        typer.secho("Extracting Mathmator-Model.gguf...", fg=typer.colors.CYAN)
-        try:
-            with zipfile.ZipFile(MERGED_MODEL_ZIP_PATH, 'r') as zip_ref:
-                zip_ref.extractall(".")
-            if os.path.exists(MERGED_MODEL_ZIP_PATH):
-                os.remove(MERGED_MODEL_ZIP_PATH)
-        except Exception as e:
-            typer.secho(f"Extraction failed: {e}", fg=typer.colors.RED)
-            sys.exit(1)
-            
-    # 2. Configure Llama for GPU (No LoRA parameter needed)
-    llm_kwargs = {
-        "model_path": MERGED_MODEL_PATH,
-        "n_ctx": 2048,                      # Full context since we have no LoRA split issues
-        "n_gpu_layers": -1,                 # 100% on GPU for max speed
-        "n_threads": 4,
-        "n_batch": 256,
-        "use_mmap": False,                  # CRITICAL for stability on Linux GPU
-        "verbose": False
-    }
-
+    typer.secho("🤖 Mathmator: GPU Detected! 🚀 (Using Base + LoRA with mmap=False to prevent Segfault)", fg=typer.colors.GREEN, bold=True)
+    gpu_layers = -1
+    use_mmap = False      # CRITICAL: Prevents GPU Segfault with LoRA
+    max_tokens_val = 1500 # GPU has memory for more tokens
+    ctx_size = 2048
 else:
-    typer.secho("🤖 Mathmator: CPU Detected! 🐢 (Using Base Model + LoRA Adapter)", fg=typer.colors.YELLOW, bold=True)
-    
-    # 1. Download Base Model if missing
-    if not os.path.exists(BASE_MODEL_PATH):
-        typer.secho("Base model not found. Downloading Meta-Llama-3-8B-Instruct-Q4_K_M.gguf...", fg=typer.colors.YELLOW)
-        torch.hub.download_url_to_file(BASE_MODEL_URL, BASE_MODEL_PATH)
+    typer.secho("🤖 Mathmator: CPU Detected! 🐢 (Using Base + LoRA with mmap=True to save RAM)", fg=typer.colors.YELLOW, bold=True)
+    gpu_layers = 0
+    use_mmap = True       # CRITICAL: Prevents OOM/Killed on CPU
+    max_tokens_val = 700  # CPU gets smaller generation to save RAM
+    ctx_size = 1024
 
-    # 2. Download/Extract LoRA if missing
-    if not os.path.exists(LORA_PATH):
-        if not os.path.exists(LORA_ZIP_PATH):
-            typer.secho("LoRA adapter not found. Downloading mathmator_lora.gguf.zip...", fg=typer.colors.YELLOW)
-            try:
-                torch.hub.download_url_to_file(LORA_ZIP_URL, LORA_ZIP_PATH)
-            except Exception as e:
-                typer.secho(f"Download failed: {e}", fg=typer.colors.RED)
-                sys.exit(1)
-                
-        typer.secho("Extracting mathmator_lora.gguf...", fg=typer.colors.CYAN)
-        try:
-            with zipfile.ZipFile(LORA_ZIP_PATH, 'r') as zip_ref:
-                zip_ref.extractall(".")
-            if os.path.exists(LORA_ZIP_PATH):
-                os.remove(LORA_ZIP_PATH)
-        except Exception as e:
-            typer.secho(f"Extraction failed: {e}", fg=typer.colors.RED)
-            sys.exit(1)
-            
-    # 3. Configure Llama for CPU (With LoRA parameter)
-    llm_kwargs = {
-        "model_path": BASE_MODEL_PATH,
-        "lora_path": LORA_PATH,
-        "n_ctx": 1024,                      # Strictly limited to prevent OS 'Killed'
-        "n_gpu_layers": 0,                  # 100% on CPU
-        "n_threads": 4,
-        "use_mmap": True,                   # CRITICAL for CPU: pages memory to disk to save RAM
-        "verbose": False
-    }
+llm_kwargs = {
+    "model_path": BASE_MODEL_PATH,
+    "lora_path": LORA_PATH,
+    "n_ctx": ctx_size,
+    "n_gpu_layers": gpu_layers,
+    "n_threads": 4,
+    "n_batch": 256 if has_gpu else 128,
+    "use_mmap": use_mmap,
+    "verbose": False
+}
 
 # --- INITIALIZE THE ADAPTIVE MODEL ---
 with SuppressStderr():
@@ -144,7 +130,6 @@ with SuppressStderr():
 
 
 # --- AUDIO MODELS ON CPU ---
-# Safely isolated on CPU to leave VRAM 100% for Llama
 device_audio = torch.device('cpu')
 model_file = 'silero_v3_en.pt'
 
@@ -264,8 +249,8 @@ def process_and_render(prompt_text: str, safe_topic_name: str, quality: Quality,
 
         output = llm(
             prompt_text, 
-            max_tokens=700 if not has_gpu else 1500, # CPU gets smaller generation to save RAM, GPU gets full 
-            stop=["<|end_of_text|>", "<|eot_id|>", "###", "```", "class Concept", "\nclass ", "\ndef ", "if __name__"], 
+            max_tokens=max_tokens_val, 
+            stop=["<|end_of_text|>", "<|eot_id|>", "###", "```", "class Concept", "\nclass ", "\ndef ", "if __name__", "\n    def ", "\nConceptScene", "\n# Run"], 
             temperature=0.1,   
             repeat_penalty=1.05,  
             stream=True
@@ -278,12 +263,37 @@ def process_and_render(prompt_text: str, safe_topic_name: str, quality: Quality,
             manim_code += text
         print("\n")
 
+        # 🧹 SMART CLEANUP & HEALING SHIELDS
         manim_code = manim_code.replace("```python", "").replace("```", "").strip()
         manim_code = re.sub(r'ApplyMethod\((.*?)\)', r'\1', manim_code)
-        manim_code = re.sub(r'\n[a-zA-Z0-9_]+\s*=\s*ConceptScene\(\).*', '', manim_code, flags=re.DOTALL)
-        manim_code = re.sub(r'\nscene\.render\(\).*', '', manim_code, flags=re.DOTALL)
-        manim_code = re.sub(r'\nif __name__\s*==.*', '', manim_code, flags=re.DOTALL)
+        manim_code = manim_code.replace("ShowCreation", "Create")
+        
+        # Kill runaway execution code
+        manim_code = re.sub(r'\n[ \t]*[a-zA-Z0-9_]+\s*=\s*ConceptScene\(\).*', '', manim_code, flags=re.DOTALL)
+        manim_code = re.sub(r'\n[ \t]*scene\.render\(\).*', '', manim_code, flags=re.DOTALL)
+        manim_code = re.sub(r'\n[ \t]*if __name__\s*==.*', '', manim_code, flags=re.DOTALL)
+        manim_code = re.sub(r'\n[ \t]*ConceptScene\(\).*', '', manim_code, flags=re.DOTALL)
+        manim_code = re.sub(r'\n[ \t]*# Run the.*', '', manim_code, flags=re.DOTALL)
         manim_code = re.sub(r'Cone\(\s*radius=', 'Cone(base_radius=', manim_code)
+
+        # 🛡️ THE ANIMATION HEALER: Fixes complex Updaters by enforcing .animate syntax
+        manim_code = re.sub(r'UpdateFromFunc\s*\(\s*lambda\s+[a-zA-Z0-9_]+\s*:\s*[a-zA-Z0-9_]+\.(.*?)\s*,\s*([a-zA-Z0-9_]+).*?\)', r'\2.animate.\1', manim_code)
+
+        # 🛡️ SMART REGEX SHIELDS: Heal the code instead of deleting the line to prevent NameErrors!
+        manim_code = re.sub(r'self\.set_background_color\((.*?)\)', r'self.camera.background_color = \1', manim_code)
+        
+        # 🛡️ THE VGROUP HEALER V3.0: Surgical precision. Fixes ONLY List Comprehensions inside VGroup!
+        # Matches: VGroup(*[Create(mob) for mob in inputs]) -> VGroup(*[mob for mob in inputs])
+        manim_code = re.sub(r'(VGroup\s*\(\s*\*?\s*\[\s*)(?:Create|Write|FadeIn|FadeOut)\s*\(\s*([^)]+)\s*\)(\s*for\s*[^\]]+\]\s*\))', r'\1\2\3', manim_code)
+
+        # If it assigns to a variable, replace the bad call with an empty VGroup so Python doesn't crash on NameError later
+        manim_code = re.sub(r'([a-zA-Z0-9_]+)\s*=\s*.*\.set_axis_labels\(.*\)', r'\1 = VGroup() # Auto-healed bad label', manim_code)
+        manim_code = re.sub(r'([a-zA-Z0-9_]+)\s*=\s*.*\.set_title\(.*\)', r'\1 = VGroup() # Auto-healed bad title', manim_code)
+        manim_code = re.sub(r'([a-zA-Z0-9_]+)\s*=\s*Title\(.*\)', r'\1 = VGroup() # Auto-healed bad Title obj', manim_code)
+        
+        # If it's a standalone call, safely comment it out
+        manim_code = re.sub(r'(^[ \t]*.*\.set_axis_labels\(.*\))', r'# \1 (Auto-removed)', manim_code, flags=re.MULTILINE)
+        manim_code = re.sub(r'(^[ \t]*.*\.set_title\(.*\))', r'# \1 (Auto-removed)', manim_code, flags=re.MULTILINE)
 
         if "Surface(" in manim_code:
             parts = manim_code.split("Surface(")
@@ -311,9 +321,33 @@ def process_and_render(prompt_text: str, safe_topic_name: str, quality: Quality,
             quality_flag = "-ql"
             quality_folder = "480p15"
 
-        speak(f"Rendering the video at {quality.value} quality.", use_voice)
+        speak(f"Rendering at {quality.value} quality. This might take a minute, please wait...", use_voice)
 
-        subprocess.run(["manim", quality_flag, temp_file, "ConceptScene", "-p"], check=True, capture_output=True, text=True)
+        # 🚀 THE MAGIC: REAL-TIME PROGRESS BAR PIPING 🚀
+        env = os.environ.copy()
+        env["FORCE_COLOR"] = "1"  # Forces Manim's rich progress bar to render even in background piping
+
+        process = subprocess.Popen(
+            ["manim", quality_flag, temp_file, "ConceptScene", "-p"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0, # Unbuffered, so we catch the progress bar updates (\r) instantly
+            env=env
+        )
+        
+        output_bytes = bytearray()
+        while True:
+            char = process.stdout.read(1)
+            if not char and process.poll() is not None:
+                break
+            if char:
+                sys.stdout.buffer.write(char) # Print strictly to terminal
+                sys.stdout.buffer.flush()
+                output_bytes.extend(char)     # Save safely in the background
+                
+        if process.returncode != 0:
+            error_text = output_bytes.decode('utf-8', errors='replace')
+            raise subprocess.CalledProcessError(process.returncode, process.args, output=error_text, stderr=error_text)
 
         video_path = os.path.join("media", "videos", f"{safe_topic_name}_scene", quality_folder, "ConceptScene.mp4")
         final_video_name = f"{safe_topic_name}.mp4"
@@ -362,10 +396,10 @@ def interactive_edit_loop(quality: Quality, keep_code: bool, use_voice: bool = F
         match = re.search(r'class ConceptScene\((.*?)\):', current_code)
         scene_type = match.group(1) if match else "Scene"
         
-        prefill_code = f"from manim import *\n\nclass ConceptScene({scene_type}):\n    def construct(self):\n        "
+        prefill_code = f"from manim import *\nimport numpy as np\n\nclass ConceptScene({scene_type}):\n    def construct(self):\n        "
         
         error_context = f"\n\nCRITICAL - The previous code crashed with this error:\n{LAST_ERROR_LOG[-400:]}\nPlease fix the error based on this." if LAST_ERROR_LOG else ""
-        prompt = f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nMake this code more professional based on the user's edit: {instruction}{error_context}\nEnsure elegant animations and CRITICALLY ensure all Python parentheses are closed properly.\n\nCurrent Code:\n{current_code}\n\n### Response:\n```python\n{prefill_code}"
+        prompt = f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nMake this code more professional based on the user's edit: {instruction}{error_context}\nEnsure elegant animations and CRITICALLY ensure all Python parentheses are closed properly.\n{MANIM_RULES}\n\nCurrent Code:\n{current_code}\n\n### Response:\n```python\n{prefill_code}"
         
         process_and_render(prompt, safe_topic_name, quality, keep_code, prefill_code, use_voice)
 
@@ -379,7 +413,7 @@ def animate(topic: str = typer.Argument(...),
     
     scene_type = "ThreeDScene" if "3d" in topic.lower() else "Scene"
         
-    prefill_code = f"from manim import *\n\nclass ConceptScene({scene_type}):\n    def construct(self):\n        "
+    prefill_code = f"from manim import *\nimport numpy as np\n\nclass ConceptScene({scene_type}):\n    def construct(self):\n        "
     
     enhanced_instruction = (
         f"Design and code a highly professional, cinematic Manim educational animation about: '{topic}'.\n"
@@ -390,6 +424,7 @@ def animate(topic: str = typer.Argument(...),
         "3. Color Palette: Use professional Manim colors (BLUE_E, TEAL, YELLOW, RED) to distinguish different components.\n"
         "4. Sequential Animation: Do not show everything at once. Animate step-by-step (e.g., draw axes, plot graph, add labels).\n"
         "5. Flow: Wait for 1 or 2 seconds between major animations using self.wait().\n"
+        f"{MANIM_RULES}\n"
         "Write only the python code."
     )
     
@@ -417,9 +452,9 @@ def edit(instruction: str = typer.Argument(...),
     match = re.search(r'class ConceptScene\((.*?)\):', current_code)
     scene_type = match.group(1) if match else "Scene"
     
-    prefill_code = f"from manim import *\n\nclass ConceptScene({scene_type}):\n    def construct(self):\n        "
+    prefill_code = f"from manim import *\nimport numpy as np\n\nclass ConceptScene({scene_type}):\n    def construct(self):\n        "
     error_context = f"\n\nCRITICAL - The previous code crashed with this error:\n{LAST_ERROR_LOG[-400:]}\nPlease fix the error based on this." if LAST_ERROR_LOG else ""
-    prompt = f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nMake this code more professional based on the user's edit: {instruction}{error_context}\nEnsure elegant animations and CRITICALLY ensure all Python parentheses are closed properly.\n\nCurrent Code:\n{current_code}\n\n### Response:\n```python\n{prefill_code}"
+    prompt = f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nMake this code more professional based on the user's edit: {instruction}{error_context}\nEnsure elegant animations and CRITICALLY ensure all Python parentheses are closed properly.\n{MANIM_RULES}\n\nCurrent Code:\n{current_code}\n\n### Response:\n```python\n{prefill_code}"
     
     process_and_render(prompt, safe_topic_name, quality, keep_code, prefill_code, use_voice=False)
     interactive_edit_loop(quality, keep_code, use_voice=False)
@@ -479,9 +514,9 @@ def voice(quality: Quality = typer.Option(Quality.low, "--quality", "-q"),
             match = re.search(r'class ConceptScene\((.*?)\):', current_code)
             scene_type = match.group(1) if match else "Scene"
             
-            prefill_code = f"from manim import *\n\nclass ConceptScene({scene_type}):\n    def construct(self):\n        "
+            prefill_code = f"from manim import *\nimport numpy as np\n\nclass ConceptScene({scene_type}):\n    def construct(self):\n        "
             error_context = f"\n\nCRITICAL - The previous code crashed with this error:\n{LAST_ERROR_LOG[-400:]}\nPlease fix the error based on this." if LAST_ERROR_LOG else ""
-            prompt = f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nMake this code more professional based on the user's edit: {command}{error_context}\nEnsure elegant animations and CRITICALLY ensure all Python parentheses are closed properly.\n\nCurrent Code:\n{current_code}\n\n### Response:\n```python\n{prefill_code}"
+            prompt = f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nMake this code more professional based on the user's edit: {command}{error_context}\nEnsure elegant animations and CRITICALLY ensure all Python parentheses are closed properly.\n{MANIM_RULES}\n\nCurrent Code:\n{current_code}\n\n### Response:\n```python\n{prefill_code}"
             
             process_and_render(prompt, safe_topic_name, quality, keep_code, prefill_code, use_voice=True)
             
@@ -490,7 +525,7 @@ def voice(quality: Quality = typer.Option(Quality.low, "--quality", "-q"),
             safe_topic_name = re.sub(r'_+', '_', safe_topic_name).strip('_')[:50].strip('_')
             scene_type = "ThreeDScene" if "3d" in command.lower() else "Scene"
             
-            prefill_code = f"from manim import *\n\nclass ConceptScene({scene_type}):\n    def construct(self):\n        "
+            prefill_code = f"from manim import *\nimport numpy as np\n\nclass ConceptScene({scene_type}):\n    def construct(self):\n        "
             
             enhanced_instruction = (
                 f"Design and code a highly professional, cinematic Manim educational animation about: '{command}'.\n"
@@ -501,6 +536,7 @@ def voice(quality: Quality = typer.Option(Quality.low, "--quality", "-q"),
                 "3. Color Palette: Use professional Manim colors (BLUE_E, TEAL, YELLOW, RED) to distinguish different components.\n"
                 "4. Sequential Animation: Do not show everything at once. Animate step-by-step (e.g., draw axes, plot graph, add labels).\n"
                 "5. Flow: Wait for 1 or 2 seconds between major animations using self.wait().\n"
+                f"{MANIM_RULES}\n"
                 "Write only the python code."
             )
             
