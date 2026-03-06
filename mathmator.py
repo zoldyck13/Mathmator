@@ -1,4 +1,10 @@
 import os
+import sys
+
+# 🩹 CRITICAL PATCH FOR PYTHON 3.12+ (Fixes manim_voiceover pkg_resources error)
+import importlib.metadata
+sys.modules['pkg_resources'] = importlib.metadata
+
 # CRITICAL: Prevent OpenMP thread conflicts between PyTorch and llama.cpp
 os.environ["OMP_NUM_THREADS"] = "4"
 os.environ["OPENBLAS_NUM_THREADS"] = "4"
@@ -11,7 +17,6 @@ import subprocess
 import shutil
 import re
 import speech_recognition as sr
-import sys
 import torch
 import sounddevice as sd
 import zipfile
@@ -50,8 +55,15 @@ MANIM_RULES = (
     "5. Title: `title = Title('Your Title Here')`\n"
     "6. Animations: Use `Create()` instead of `ShowCreation()`.\n"
     "7. Coordinates: ALL coordinates MUST be 3D arrays like `[x, y, 0]`. NEVER use 2D `[x, y]`! Example: `move_to([1, 2, 0])`\n"
-    "8. Keep loops short (max 3 iterations).\n"
-    "9. TEXT WRAPPING (CRITICAL): NEVER write long sentences in Text(). For long descriptions, ALWAYS use Paragraph('line1', 'line2', line_spacing=0.5) or use Text('...', font_size=20). If a sentence is more than 8 words, break it into multiple lines.\n"
+    "8. TEXT WRAPPING: Use Paragraph('line1', 'line2') for long text.\n"
+)
+
+# Optional Voiceover Rule
+VOICEOVER_RULE = (
+    "9. VOICEOVER (CRITICAL): You are inheriting from VoiceoverScene. You MUST wrap animations in voiceover blocks to explain the math.\n"
+    "   Example:\n"
+    "   with self.voiceover(text=\"Here we draw a circle.\") as tracker:\n"
+    "       self.play(Create(circle), run_time=tracker.duration)\n"
 )
 
 class SuppressStderr:
@@ -73,7 +85,6 @@ def check_gpu():
         return False
 
 # --- DYNAMIC HARDWARE DETECTION & DOWNLOAD LOGIC ---
-# Download models if they don't exist
 if not os.path.exists(BASE_MODEL_PATH):
     typer.secho("Base model not found. Downloading Meta-Llama-3-8B-Instruct-Q4_K_M.gguf...", fg=typer.colors.YELLOW)
     torch.hub.download_url_to_file(BASE_MODEL_URL, BASE_MODEL_PATH)
@@ -97,20 +108,19 @@ if not os.path.exists(LORA_PATH):
         typer.secho(f"Extraction failed: {e}", fg=typer.colors.RED)
         sys.exit(1)
 
-# Configure hardware settings dynamically
 has_gpu = check_gpu()
 
 if has_gpu:
     typer.secho("🤖 Mathmator: GPU Detected! 🚀 (Using Base + LoRA with mmap=False to prevent Segfault)", fg=typer.colors.GREEN, bold=True)
     gpu_layers = -1
-    use_mmap = False      # CRITICAL: Prevents GPU Segfault with LoRA
-    max_tokens_val = 1500 # GPU has memory for more tokens
+    use_mmap = False      
+    max_tokens_val = 1800 
     ctx_size = 2048
 else:
     typer.secho("🤖 Mathmator: CPU Detected! 🐢 (Using Base + LoRA with mmap=True to save RAM)", fg=typer.colors.YELLOW, bold=True)
     gpu_layers = 0
-    use_mmap = True       # CRITICAL: Prevents OOM/Killed on CPU
-    max_tokens_val = 700  # CPU gets smaller generation to save RAM
+    use_mmap = True       
+    max_tokens_val = 900  
     ctx_size = 1024
 
 llm_kwargs = {
@@ -239,139 +249,182 @@ def explain_error_speech(error_log: str) -> str:
     except Exception:
         return "It seems there is a syntax error in the code. Would you like me to try and fix it?"
 
-def process_and_render(prompt_text: str, safe_topic_name: str, quality: Quality, keep_code: bool, prefill: str, use_voice: bool = False):
+def process_and_render(prompt_text: str, safe_topic_name: str, quality: Quality, keep_code: bool, prefill: str, use_voice: bool = False, max_retries: int = 2, rules_used: str = MANIM_RULES):
     global LAST_ERROR_LOG
     temp_file = f"{safe_topic_name}_scene.py"
+    current_prompt = prompt_text
     
-    try:
-        typer.secho("\n🧠 Mathmator writing now ...\n", fg=typer.colors.BLUE)
-        print(prefill, end="", flush=True)
-
-        output = llm(
-            prompt_text, 
-            max_tokens=max_tokens_val, 
-            stop=["<|end_of_text|>", "<|eot_id|>", "###", "```", "class Concept", "\nclass ", "\ndef ", "if __name__", "\n    def ", "\nConceptScene", "\n# Run"], 
-            temperature=0.1,   
-            repeat_penalty=1.05,  
-            stream=True
-        )
-        
-        manim_code = prefill
-        for chunk in output:
-            text = chunk["choices"][0].get("text", "")
-            print(text, end="", flush=True) 
-            manim_code += text
-        print("\n")
-
-        # 🧹 SMART CLEANUP & HEALING SHIELDS
-        manim_code = manim_code.replace("```python", "").replace("```", "").strip()
-        manim_code = re.sub(r'ApplyMethod\((.*?)\)', r'\1', manim_code)
-        manim_code = manim_code.replace("ShowCreation", "Create")
-        
-        # Kill runaway execution code
-        manim_code = re.sub(r'\n[ \t]*[a-zA-Z0-9_]+\s*=\s*ConceptScene\(\).*', '', manim_code, flags=re.DOTALL)
-        manim_code = re.sub(r'\n[ \t]*scene\.render\(\).*', '', manim_code, flags=re.DOTALL)
-        manim_code = re.sub(r'\n[ \t]*if __name__\s*==.*', '', manim_code, flags=re.DOTALL)
-        manim_code = re.sub(r'\n[ \t]*ConceptScene\(\).*', '', manim_code, flags=re.DOTALL)
-        manim_code = re.sub(r'\n[ \t]*# Run the.*', '', manim_code, flags=re.DOTALL)
-        manim_code = re.sub(r'Cone\(\s*radius=', 'Cone(base_radius=', manim_code)
-
-        # 🛡️ THE ANIMATION HEALER: Fixes complex Updaters by enforcing .animate syntax
-        manim_code = re.sub(r'UpdateFromFunc\s*\(\s*lambda\s+[a-zA-Z0-9_]+\s*:\s*[a-zA-Z0-9_]+\.(.*?)\s*,\s*([a-zA-Z0-9_]+).*?\)', r'\2.animate.\1', manim_code)
-
-        # 🛡️ SMART REGEX SHIELDS: Heal the code instead of deleting the line to prevent NameErrors!
-        manim_code = re.sub(r'self\.set_background_color\((.*?)\)', r'self.camera.background_color = \1', manim_code)
-        
-        # 🛡️ THE VGROUP HEALER V3.0: Surgical precision. Fixes ONLY List Comprehensions inside VGroup!
-        # Matches: VGroup(*[Create(mob) for mob in inputs]) -> VGroup(*[mob for mob in inputs])
-        manim_code = re.sub(r'(VGroup\s*\(\s*\*?\s*\[\s*)(?:Create|Write|FadeIn|FadeOut)\s*\(\s*([^)]+)\s*\)(\s*for\s*[^\]]+\]\s*\))', r'\1\2\3', manim_code)
-
-        # If it assigns to a variable, replace the bad call with an empty VGroup so Python doesn't crash on NameError later
-        manim_code = re.sub(r'([a-zA-Z0-9_]+)\s*=\s*.*\.set_axis_labels\(.*\)', r'\1 = VGroup() # Auto-healed bad label', manim_code)
-        manim_code = re.sub(r'([a-zA-Z0-9_]+)\s*=\s*.*\.set_title\(.*\)', r'\1 = VGroup() # Auto-healed bad title', manim_code)
-        manim_code = re.sub(r'([a-zA-Z0-9_]+)\s*=\s*Title\(.*\)', r'\1 = VGroup() # Auto-healed bad Title obj', manim_code)
-        
-        # If it's a standalone call, safely comment it out
-        manim_code = re.sub(r'(^[ \t]*.*\.set_axis_labels\(.*\))', r'# \1 (Auto-removed)', manim_code, flags=re.MULTILINE)
-        manim_code = re.sub(r'(^[ \t]*.*\.set_title\(.*\))', r'# \1 (Auto-removed)', manim_code, flags=re.MULTILINE)
-
-        if "Surface(" in manim_code:
-            parts = manim_code.split("Surface(")
-            for i in range(1, len(parts)):
-                parts[i] = parts[i].replace("x_range", "u_range").replace("y_range", "v_range")
-            manim_code = "Surface(".join(parts)
-
-        manim_code = manim_code.rstrip()
-        if not re.search(r'self\.wait\([^)]*\)\s*$', manim_code):
-            manim_code += "\n        self.wait(2)"
-
-        with open(temp_file, "w", encoding="utf-8") as f:
-            f.write(manim_code)
-            
-        with open(LATEST_CODE_FILE, "w", encoding="utf-8") as f:
-            f.write(manim_code)
-
-        if quality == Quality.medium:
-            quality_flag = "-qm"
-            quality_folder = "720p30"
-        elif quality == Quality.high:
-            quality_flag = "-qh"
-            quality_folder = "1080p60"
-        else:
-            quality_flag = "-ql"
-            quality_folder = "480p15"
-
-        speak(f"Rendering at {quality.value} quality. This might take a minute, please wait...", use_voice)
-
-        # 🚀 THE MAGIC: REAL-TIME PROGRESS BAR PIPING 🚀
-        env = os.environ.copy()
-        env["FORCE_COLOR"] = "1"  # Forces Manim's rich progress bar to render even in background piping
-
-        process = subprocess.Popen(
-            ["manim", quality_flag, temp_file, "ConceptScene", "-p"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=0, # Unbuffered, so we catch the progress bar updates (\r) instantly
-            env=env
-        )
-        
-        output_bytes = bytearray()
-        while True:
-            char = process.stdout.read(1)
-            if not char and process.poll() is not None:
-                break
-            if char:
-                sys.stdout.buffer.write(char) # Print strictly to terminal
-                sys.stdout.buffer.flush()
-                output_bytes.extend(char)     # Save safely in the background
+    for attempt in range(max_retries + 1):
+        try:
+            if attempt > 0:
+                typer.secho(f"\n🔄 [Auto-Healing] Agent is fixing the error... (Attempt {attempt}/{max_retries})", fg=typer.colors.YELLOW, bold=True)
+                speak(f"I found an error in the code. Let me fix that for you, attempt {attempt}.", use_voice)
+            else:
+                typer.secho("\n🧠 Mathmator writing now ...\n", fg=typer.colors.BLUE)
                 
-        if process.returncode != 0:
-            error_text = output_bytes.decode('utf-8', errors='replace')
-            raise subprocess.CalledProcessError(process.returncode, process.args, output=error_text, stderr=error_text)
+            print(prefill, end="", flush=True)
 
-        video_path = os.path.join("media", "videos", f"{safe_topic_name}_scene", quality_folder, "ConceptScene.mp4")
-        final_video_name = f"{safe_topic_name}.mp4"
+            output = llm(
+                current_prompt, 
+                max_tokens=max_tokens_val, 
+                stop=["<|end_of_text|>", "<|eot_id|>", "###", "```", "class Concept", "\nclass ", "\ndef ", "if __name__", "\n    def ", "\nConceptScene", "\n# Run"], 
+                temperature=0.2 if attempt > 0 else 0.1,  
+                repeat_penalty=1.05,  
+                stream=True
+            )
+            
+            manim_code = prefill
+            for chunk in output:
+                text = chunk["choices"][0].get("text", "")
+                print(text, end="", flush=True) 
+                manim_code += text
+            print("\n")
 
-        if os.path.exists(video_path):
-            shutil.copy(video_path, final_video_name)
-            LAST_ERROR_LOG = ""  # Clear error on success
-            speak("Finished successfully! The video is ready.", use_voice)
-        else:
-            speak("Video was generated but couldn't be found.", use_voice)
+            # 🧹 SMART CLEANUP & HEALING SHIELDS
+            manim_code = manim_code.replace("```python", "").replace("```", "").strip()
+            manim_code = re.sub(r'ApplyMethod\((.*?)\)', r'\1', manim_code)
+            manim_code = manim_code.replace("ShowCreation", "Create")
+            
+            manim_code = re.sub(r'\n[ \t]*[a-zA-Z0-9_]+\s*=\s*ConceptScene\(\).*', '', manim_code, flags=re.DOTALL)
+            manim_code = re.sub(r'\n[ \t]*scene\.render\(\).*', '', manim_code, flags=re.DOTALL)
+            manim_code = re.sub(r'\n[ \t]*if __name__\s*==.*', '', manim_code, flags=re.DOTALL)
+            manim_code = re.sub(r'\n[ \t]*ConceptScene\(\).*', '', manim_code, flags=re.DOTALL)
+            manim_code = re.sub(r'\n[ \t]*# Run the.*', '', manim_code, flags=re.DOTALL)
+            manim_code = re.sub(r'Cone\(\s*radius=', 'Cone(base_radius=', manim_code)
 
-    except subprocess.CalledProcessError as e:
-        error_output = e.stderr if e.stderr else e.stdout
-        LAST_ERROR_LOG = error_output  # Save the error for the AI to fix later
-        typer.secho(error_output, fg=typer.colors.RED)
-        explanation = explain_error_speech(error_output)
-        speak(explanation, use_voice)
-    except Exception as e:
-        typer.secho(f"An unexpected error occurred: {e}", fg=typer.colors.RED)
-    finally:
-        if not keep_code and os.path.exists(temp_file):
-            os.remove(temp_file)
+            manim_code = re.sub(r'UpdateFromFunc\s*\(\s*lambda\s+[a-zA-Z0-9_]+\s*:\s*[a-zA-Z0-9_]+\.(.*?)\s*,\s*([a-zA-Z0-9_]+).*?\)', r'\2.animate.\1', manim_code)
+            manim_code = re.sub(r'MoveToTarget\s*\(\s*([^,]+)\s*,\s*(\[.*?\])\s*\)', r'\1.animate.move_to(\2)', manim_code)
+            manim_code = re.sub(r'\bCYAN\b', 'TEAL', manim_code)
+            manim_code = re.sub(r'\bMAGENTA\b', 'PURPLE', manim_code)
+            manim_code = re.sub(r'\bBROWN\b', 'MAROON', manim_code)
+            manim_code = re.sub(r'(get_[xyz]_axis_label\([^,]+),\s*color=([^)]+)\)', r'\1).set_color(\2)', manim_code)
+            manim_code = re.sub(r'self\.set_background_color\((.*?)\)', r'self.camera.background_color = \1', manim_code)
+            # 🛡️ ANTI-CLICHE SHIELD: Silently remove boring default text elements
+            manim_code = re.sub(r'([a-zA-Z0-9_]+)\s*=\s*Text\(\s*["\'](Welcome to|In conclusion|This is|A fundamental).*?["\'].*?\)', r'\1 = VGroup()', manim_code, flags=re.IGNORECASE)
+            manim_code = re.sub(r'([a-zA-Z0-9_]+)\s*=\s*Paragraph\(.*?\)', r'\1 = VGroup()', manim_code, flags=re.DOTALL)
+            
+            # Safe Play wrapper that ignores tracker.duration
+            def wrap_play(match):
+                content = match.group(1)
+                if any(keyword in content for keyword in ['Create', 'Write', 'Fade', 'Transform', 'animate', 'Update', 'Move']):
+                    return match.group(0)
+                return f'self.play(Create({content}))'
+            manim_code = re.sub(r'self\.play\((.*?)\)', wrap_play, manim_code)
 
-def interactive_edit_loop(quality: Quality, keep_code: bool, use_voice: bool = False):
+            manim_code = re.sub(r'(VGroup\s*\(\s*\*?\s*\[\s*)(?:Create|Write|FadeIn|FadeOut)\s*\(\s*([^)]+)\s*\)(\s*for\s*[^\]]+\]\s*\))', r'\1\2\3', manim_code)
+            manim_code = re.sub(r'([a-zA-Z0-9_]+)\s*=\s*.*\.set_axis_labels\(.*\)', r'\1 = VGroup() # Auto-healed bad label', manim_code)
+            manim_code = re.sub(r'([a-zA-Z0-9_]+)\s*=\s*.*\.set_title\(.*\)', r'\1 = VGroup() # Auto-healed bad title', manim_code)
+            manim_code = re.sub(r'([a-zA-Z0-9_]+)\s*=\s*Title\(.*\)', r'\1 = VGroup() # Auto-healed bad Title obj', manim_code)
+            manim_code = re.sub(r'(^[ \t]*.*\.set_axis_labels\(.*\))', r'# \1 (Auto-removed)', manim_code, flags=re.MULTILINE)
+            manim_code = re.sub(r'(^[ \t]*.*\.set_title\(.*\))', r'# \1 (Auto-removed)', manim_code, flags=re.MULTILINE)
+
+            def scale_long_text(match):
+                full_text = match.group(0)
+                content = match.group(1)
+                if len(content) > 50:
+                    return f'{full_text}.scale_to_fit_width(config.frame_width - 1.5)'
+                return full_text
+            manim_code = re.sub(r'Text\(\s*["\'](.*?)["\']\s*.*?\)', scale_long_text, manim_code)
+
+            if "Surface(" in manim_code:
+                parts = manim_code.split("Surface(")
+                for i in range(1, len(parts)):
+                    parts[i] = parts[i].replace("x_range", "u_range").replace("y_range", "v_range")
+                manim_code = "Surface(".join(parts)
+
+            manim_code = manim_code.rstrip()
+            if not re.search(r'self\.wait\([^)]*\)\s*$', manim_code):
+                manim_code += "\n        self.wait(2)"
+
+            with open(temp_file, "w", encoding="utf-8") as f:
+                f.write(manim_code)
+                
+            with open(LATEST_CODE_FILE, "w", encoding="utf-8") as f:
+                f.write(manim_code)
+
+            if quality == Quality.medium:
+                quality_flag = "-qm"
+                quality_folder = "720p30"
+            elif quality == Quality.high:
+                quality_flag = "-qh"
+                quality_folder = "1080p60"
+            else:
+                quality_flag = "-ql"
+                quality_folder = "480p15"
+
+            speak(f"Rendering at {quality.value} quality. This might take a minute, please wait...", use_voice)
+
+            env = os.environ.copy()
+            env["FORCE_COLOR"] = "1" 
+
+            process = subprocess.Popen(
+                ["manim", quality_flag, temp_file, "ConceptScene", "-p"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=0, 
+                env=env
+            )
+            
+            output_bytes = bytearray()
+            while True:
+                char = process.stdout.read(1)
+                if not char and process.poll() is not None:
+                    break
+                if char:
+                    sys.stdout.buffer.write(char) 
+                    sys.stdout.buffer.flush()
+                    output_bytes.extend(char)     
+                    
+            if process.returncode != 0:
+                error_text = output_bytes.decode('utf-8', errors='replace')
+                raise subprocess.CalledProcessError(process.returncode, process.args, output=error_text, stderr=error_text)
+
+            video_path = os.path.join("media", "videos", f"{safe_topic_name}_scene", quality_folder, "ConceptScene.mp4")
+            final_video_name = f"{safe_topic_name}.mp4"
+
+            if os.path.exists(video_path):
+                shutil.copy(video_path, final_video_name)
+                LAST_ERROR_LOG = ""  
+                speak("Finished successfully! The video is ready.", use_voice)
+                return True 
+            else:
+                raise FileNotFoundError("Video generated but path not found.")
+
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            error_output = getattr(e, 'output', str(e))
+            LAST_ERROR_LOG = error_output  
+            
+            clean_log = re.sub(r'\x1b\[[0-9;]*m', '', error_output)
+            short_error = clean_log[-800:].strip()
+            
+            if attempt == max_retries:
+                typer.secho(f"\n❌ Mathmator Agent Failed after {max_retries} attempts.", fg=typer.colors.RED, bold=True)
+                typer.secho(error_output, fg=typer.colors.RED)
+                explanation = explain_error_speech(error_output)
+                speak(explanation, use_voice)
+                return False
+                
+            current_prompt = (
+                "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n"
+                "### Instruction:\n"
+                "CRITICAL ERROR: The python code you just generated crashed with the following error:\n"
+                f"```text\n{short_error}\n```\n"
+                "Analyze the error carefully. Rewrite the complete, fully functioning code to FIX this error. Ensure all parentheses are closed and objects exist.\n"
+                f"{rules_used}\n\n"
+                "### Broken Code:\n"
+                f"```python\n{manim_code}\n```\n\n"
+                f"### Response:\n```python\n{prefill}"
+            )
+            
+        except Exception as e:
+            typer.secho(f"An unexpected system error occurred: {e}", fg=typer.colors.RED)
+            return False
+            
+        finally:
+            if not keep_code and os.path.exists(temp_file):
+                os.remove(temp_file)
+
+def interactive_edit_loop(quality: Quality, keep_code: bool, use_voice: bool = False, voiceover: bool = False):
     global LAST_ERROR_LOG
     while True:
         typer.secho("\n" + "="*60, fg=typer.colors.MAGENTA)
@@ -394,49 +447,98 @@ def interactive_edit_loop(quality: Quality, keep_code: bool, use_voice: bool = F
             safe_topic_name = "interactive_edit"
         
         match = re.search(r'class ConceptScene\((.*?)\):', current_code)
-        scene_type = match.group(1) if match else "Scene"
+        old_scene_type = match.group(1) if match else "Scene"
+        is_3d = "ThreeDScene" in old_scene_type
         
-        prefill_code = f"from manim import *\nimport numpy as np\n\nclass ConceptScene({scene_type}):\n    def construct(self):\n        "
+        base_scene = "ThreeDScene" if is_3d else "Scene"
         
+        if voiceover:
+            scene_type = f"VoiceoverScene, {base_scene}" if is_3d else "VoiceoverScene"
+            prefill_code = (
+                "from manim import *\n"
+                "import numpy as np\n"
+                "from manim_voiceover import VoiceoverScene\n"
+                "from manim_voiceover.services.gtts import GTTSService\n\n"
+                f"class ConceptScene({scene_type}):\n"
+                "    def construct(self):\n"
+                "        self.set_speech_service(GTTSService(lang='en', tld='com'))\n"
+                "        "
+            )
+            rules = MANIM_RULES + VOICEOVER_RULE
+        else:
+            scene_type = base_scene
+            prefill_code = (
+                "from manim import *\n"
+                "import numpy as np\n\n"
+                f"class ConceptScene({scene_type}):\n"
+                "    def construct(self):\n"
+                "        "
+            )
+            rules = MANIM_RULES
+            
         error_context = f"\n\nCRITICAL - The previous code crashed with this error:\n{LAST_ERROR_LOG[-400:]}\nPlease fix the error based on this." if LAST_ERROR_LOG else ""
-        prompt = f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nMake this code more professional based on the user's edit: {instruction}{error_context}\nEnsure elegant animations and CRITICALLY ensure all Python parentheses are closed properly.\n{MANIM_RULES}\n\nCurrent Code:\n{current_code}\n\n### Response:\n```python\n{prefill_code}"
+        prompt = f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nMake this code more professional based on the user's edit: {instruction}{error_context}\nEnsure elegant animations and CRITICALLY ensure all Python parentheses are closed properly.\n{rules}\n\nCurrent Code:\n{current_code}\n\n### Response:\n```python\n{prefill_code}"
         
-        process_and_render(prompt, safe_topic_name, quality, keep_code, prefill_code, use_voice)
+        process_and_render(prompt, safe_topic_name, quality, keep_code, prefill_code, use_voice, rules_used=rules)
 
 @app.command()
 def animate(topic: str = typer.Argument(...),
             quality: Quality = typer.Option(Quality.low, "--quality", "-q"),
-            keep_code: bool = typer.Option(False, "--keep-code", "-k")):
+            keep_code: bool = typer.Option(False, "--keep-code", "-k"),
+            voiceover: bool = typer.Option(False, "--voiceover", "--explain", "-v", help="Enable AI voiceover explanation")):
     
     safe_topic_name = re.sub(r'[^a-zA-Z0-9]', '_', topic)
     safe_topic_name = re.sub(r'_+', '_', safe_topic_name).strip('_')[:50].strip('_')
     
-    scene_type = "ThreeDScene" if "3d" in topic.lower() else "Scene"
-        
-    prefill_code = f"from manim import *\nimport numpy as np\n\nclass ConceptScene({scene_type}):\n    def construct(self):\n        "
+    is_3d = "3d" in topic.lower()
+    base_scene = "ThreeDScene" if is_3d else "Scene"
+    
+    if voiceover:
+        scene_type = f"VoiceoverScene, {base_scene}" if is_3d else "VoiceoverScene"
+        prefill_code = (
+            "from manim import *\n"
+            "import numpy as np\n"
+            "from manim_voiceover import VoiceoverScene\n"
+            "from manim_voiceover.services.gtts import GTTSService\n\n"
+            f"class ConceptScene({scene_type}):\n"
+            "    def construct(self):\n"
+            "        self.set_speech_service(GTTSService(lang='en', tld='com'))\n"
+            "        "
+        )
+        rules = MANIM_RULES + VOICEOVER_RULE
+    else:
+        scene_type = base_scene
+        prefill_code = (
+            "from manim import *\n"
+            "import numpy as np\n\n"
+            f"class ConceptScene({scene_type}):\n"
+            "    def construct(self):\n"
+            "        "
+        )
+        rules = MANIM_RULES
     
     enhanced_instruction = (
-        f"Design and code a highly professional, cinematic Manim educational animation about: '{topic}'.\n"
-        "You are an expert director and mathematician (like 3Blue1Brown). Think deeply about the concept and intelligently expand on the user's idea by adding necessary mathematical context, beautiful visual elements, and logical step-by-step explanations.\n"
-        "Follow these strict design guidelines:\n"
-        "1. Professional Layout: Arrange elements elegantly. Use appropriate scaling and positioning so nothing overlaps the screen edges.\n"
-        "2. Creative Typography: Be creative and organic with text. Do not restrict yourself to always adding a static title at the top. Place labels and explanations dynamically where they make the most sense visually.\n"
-        "3. Color Palette: Use professional Manim colors (BLUE_E, TEAL, YELLOW, RED) to distinguish different components.\n"
-        "4. Sequential Animation: Do not show everything at once. Animate step-by-step (e.g., draw axes, plot graph, add labels).\n"
-        "5. Flow: Wait for 1 or 2 seconds between major animations using self.wait().\n"
-        f"{MANIM_RULES}\n"
-        "Write only the python code."
+        f"Generate highly professional Manim CE Python code for: '{topic}'.\n"
+        "CRITICAL DIRECTIVES: YOU MUST OBEY THESE RULES OR THE CODE WILL BE REJECTED.\n"
+        "1. ZERO CLICHES: DO NOT write 'Welcome to...', 'Introduction', or 'Conclusion'. NO paragraphs of text.\n"
+        "2. VISUAL MATHEMATICS ONLY: Your scene MUST consist of Axes, geometric shapes, dynamic lines, dots tracing paths, and MathTex formulas. Focus 100% on the geometric and mathematical visualization.\n"
+        "3. PROHIBIT LONG TEXT: NEVER use `Text()` for sentences. Only use `Text()` for short 1-3 word labels.\n"
+        "4. DYNAMIC ANIMATIONS: If rendering a sine wave, DO NOT just plot it instantly. You MUST animate a Dot moving along the curve, or animate the axes drawing first, then the curve drawing from left to right using `Create(graph, run_time=3)`.\n"
+        "5. LAYOUT: Prevent overlapping. Use `.to_edge(UP)` or precise coordinates like `move_to([x, y, 0])`.\n"
+        f"{rules}\n"
+        "Write ONLY the pure Python code."
     )
     
     prompt = f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{enhanced_instruction}\n\n### Response:\n```python\n{prefill_code}"
     
-    process_and_render(prompt, safe_topic_name, quality, keep_code, prefill_code, use_voice=False)
-    interactive_edit_loop(quality, keep_code, use_voice=False)
+    process_and_render(prompt, safe_topic_name, quality, keep_code, prefill_code, use_voice=False, rules_used=rules)
+    interactive_edit_loop(quality, keep_code, use_voice=False, voiceover=voiceover)
 
 @app.command()
 def edit(instruction: str = typer.Argument(...),
          quality: Quality = typer.Option(Quality.low, "--quality", "-q"),
-         keep_code: bool = typer.Option(False, "--keep-code", "-k")):
+         keep_code: bool = typer.Option(False, "--keep-code", "-k"),
+         voiceover: bool = typer.Option(False, "--voiceover", "--explain", "-v", help="Enable AI voiceover explanation")):
     
     global LAST_ERROR_LOG
     if not os.path.exists(LATEST_CODE_FILE):
@@ -450,18 +552,45 @@ def edit(instruction: str = typer.Argument(...),
     safe_topic_name = re.sub(r'_+', '_', safe_topic_name).strip('_')[:50].strip('_')
     
     match = re.search(r'class ConceptScene\((.*?)\):', current_code)
-    scene_type = match.group(1) if match else "Scene"
+    old_scene_type = match.group(1) if match else "Scene"
+    is_3d = "ThreeDScene" in old_scene_type
     
-    prefill_code = f"from manim import *\nimport numpy as np\n\nclass ConceptScene({scene_type}):\n    def construct(self):\n        "
+    base_scene = "ThreeDScene" if is_3d else "Scene"
+    
+    if voiceover:
+        scene_type = f"VoiceoverScene, {base_scene}" if is_3d else "VoiceoverScene"
+        prefill_code = (
+            "from manim import *\n"
+            "import numpy as np\n"
+            "from manim_voiceover import VoiceoverScene\n"
+            "from manim_voiceover.services.gtts import GTTSService\n\n"
+            f"class ConceptScene({scene_type}):\n"
+            "    def construct(self):\n"
+            "        self.set_speech_service(GTTSService(lang='en', tld='com'))\n"
+            "        "
+        )
+        rules = MANIM_RULES + VOICEOVER_RULE
+    else:
+        scene_type = base_scene
+        prefill_code = (
+            "from manim import *\n"
+            "import numpy as np\n\n"
+            f"class ConceptScene({scene_type}):\n"
+            "    def construct(self):\n"
+            "        "
+        )
+        rules = MANIM_RULES
+    
     error_context = f"\n\nCRITICAL - The previous code crashed with this error:\n{LAST_ERROR_LOG[-400:]}\nPlease fix the error based on this." if LAST_ERROR_LOG else ""
-    prompt = f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nMake this code more professional based on the user's edit: {instruction}{error_context}\nEnsure elegant animations and CRITICALLY ensure all Python parentheses are closed properly.\n{MANIM_RULES}\n\nCurrent Code:\n{current_code}\n\n### Response:\n```python\n{prefill_code}"
+    prompt = f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nMake this code more professional based on the user's edit: {instruction}{error_context}\nEnsure elegant animations and CRITICALLY ensure all Python parentheses are closed properly.\n{rules}\n\nCurrent Code:\n{current_code}\n\n### Response:\n```python\n{prefill_code}"
     
-    process_and_render(prompt, safe_topic_name, quality, keep_code, prefill_code, use_voice=False)
-    interactive_edit_loop(quality, keep_code, use_voice=False)
+    process_and_render(prompt, safe_topic_name, quality, keep_code, prefill_code, use_voice=False, rules_used=rules)
+    interactive_edit_loop(quality, keep_code, use_voice=False, voiceover=voiceover)
 
 @app.command()
 def voice(quality: Quality = typer.Option(Quality.low, "--quality", "-q"),
-          keep_code: bool = typer.Option(False, "--keep-code", "-k")):
+          keep_code: bool = typer.Option(False, "--keep-code", "-k"),
+          voiceover: bool = typer.Option(False, "--voiceover", "--explain", "-v", help="Enable AI voiceover explanation")):
     
     global LAST_ERROR_LOG
     speak("Voice mode activated. Press Enter when you are ready to speak.", use_voice=True)
@@ -512,37 +641,86 @@ def voice(quality: Quality = typer.Option(Quality.low, "--quality", "-q"),
                 safe_topic_name = "interactive_edit"
             
             match = re.search(r'class ConceptScene\((.*?)\):', current_code)
-            scene_type = match.group(1) if match else "Scene"
+            old_scene_type = match.group(1) if match else "Scene"
+            is_3d = "ThreeDScene" in old_scene_type
             
-            prefill_code = f"from manim import *\nimport numpy as np\n\nclass ConceptScene({scene_type}):\n    def construct(self):\n        "
+            base_scene = "ThreeDScene" if is_3d else "Scene"
+            
+            if voiceover:
+                scene_type = f"VoiceoverScene, {base_scene}" if is_3d else "VoiceoverScene"
+                prefill_code = (
+                    "from manim import *\n"
+                    "import numpy as np\n"
+                    "from manim_voiceover import VoiceoverScene\n"
+                    "from manim_voiceover.services.gtts import GTTSService\n\n"
+                    f"class ConceptScene({scene_type}):\n"
+                    "    def construct(self):\n"
+                    "        self.set_speech_service(GTTSService(lang='en', tld='com'))\n"
+                    "        "
+                )
+                rules = MANIM_RULES + VOICEOVER_RULE
+            else:
+                scene_type = base_scene
+                prefill_code = (
+                    "from manim import *\n"
+                    "import numpy as np\n\n"
+                    f"class ConceptScene({scene_type}):\n"
+                    "    def construct(self):\n"
+                    "        "
+                )
+                rules = MANIM_RULES
+            
             error_context = f"\n\nCRITICAL - The previous code crashed with this error:\n{LAST_ERROR_LOG[-400:]}\nPlease fix the error based on this." if LAST_ERROR_LOG else ""
-            prompt = f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nMake this code more professional based on the user's edit: {command}{error_context}\nEnsure elegant animations and CRITICALLY ensure all Python parentheses are closed properly.\n{MANIM_RULES}\n\nCurrent Code:\n{current_code}\n\n### Response:\n```python\n{prefill_code}"
+            prompt = f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nMake this code more professional based on the user's edit: {command}{error_context}\nEnsure elegant animations and CRITICALLY ensure all Python parentheses are closed properly.\n{rules}\n\nCurrent Code:\n{current_code}\n\n### Response:\n```python\n{prefill_code}"
             
-            process_and_render(prompt, safe_topic_name, quality, keep_code, prefill_code, use_voice=True)
+            process_and_render(prompt, safe_topic_name, quality, keep_code, prefill_code, use_voice=True, rules_used=rules)
             
         else:
             safe_topic_name = re.sub(r'[^a-zA-Z0-9]', '_', command)
             safe_topic_name = re.sub(r'_+', '_', safe_topic_name).strip('_')[:50].strip('_')
-            scene_type = "ThreeDScene" if "3d" in command.lower() else "Scene"
             
-            prefill_code = f"from manim import *\nimport numpy as np\n\nclass ConceptScene({scene_type}):\n    def construct(self):\n        "
+            is_3d = "3d" in command.lower()
+            base_scene = "ThreeDScene" if is_3d else "Scene"
+            
+            if voiceover:
+                scene_type = f"VoiceoverScene, {base_scene}" if is_3d else "VoiceoverScene"
+                prefill_code = (
+                    "from manim import *\n"
+                    "import numpy as np\n"
+                    "from manim_voiceover import VoiceoverScene\n"
+                    "from manim_voiceover.services.gtts import GTTSService\n\n"
+                    f"class ConceptScene({scene_type}):\n"
+                    "    def construct(self):\n"
+                    "        self.set_speech_service(GTTSService(lang='en', tld='com'))\n"
+                    "        "
+                )
+                rules = MANIM_RULES + VOICEOVER_RULE
+            else:
+                scene_type = base_scene
+                prefill_code = (
+                    "from manim import *\n"
+                    "import numpy as np\n\n"
+                    f"class ConceptScene({scene_type}):\n"
+                    "    def construct(self):\n"
+                    "        "
+                )
+                rules = MANIM_RULES
             
             enhanced_instruction = (
-                f"Design and code a highly professional, cinematic Manim educational animation about: '{command}'.\n"
-                "You are an expert director and mathematician (like 3Blue1Brown). Think deeply about the concept and intelligently expand on the user's idea by adding necessary mathematical context, beautiful visual elements, and logical step-by-step explanations.\n"
-                "Follow these strict design guidelines:\n"
-                "1. Professional Layout: Arrange elements elegantly. Use appropriate scaling and positioning so nothing overlaps the screen edges.\n"
-                "2. Creative Typography: Be creative and organic with text. Do not restrict yourself to always adding a static title at the top. Place labels and explanations dynamically where they make the most sense visually.\n"
-                "3. Color Palette: Use professional Manim colors (BLUE_E, TEAL, YELLOW, RED) to distinguish different components.\n"
-                "4. Sequential Animation: Do not show everything at once. Animate step-by-step (e.g., draw axes, plot graph, add labels).\n"
-                "5. Flow: Wait for 1 or 2 seconds between major animations using self.wait().\n"
-                f"{MANIM_RULES}\n"
-                "Write only the python code."
+                f"Generate highly professional Manim CE Python code for: '{command}'.\n"
+                "CRITICAL DIRECTIVES: YOU MUST OBEY THESE RULES OR THE CODE WILL BE REJECTED.\n"
+                "1. ZERO CLICHES: DO NOT write 'Welcome to...', 'Introduction', or 'Conclusion'. NO paragraphs of text.\n"
+                "2. VISUAL MATHEMATICS ONLY: Your scene MUST consist of Axes, geometric shapes, dynamic lines, dots tracing paths, and MathTex formulas. Focus 100% on the geometric and mathematical visualization.\n"
+                "3. PROHIBIT LONG TEXT: NEVER use `Text()` for sentences. Only use `Text()` for short 1-3 word labels.\n"
+                "4. DYNAMIC ANIMATIONS: If rendering a sine wave, DO NOT just plot it instantly. You MUST animate a Dot moving along the curve, or animate the axes drawing first, then the curve drawing from left to right using `Create(graph, run_time=3)`.\n"
+                "5. LAYOUT: Prevent overlapping. Use `.to_edge(UP)` or precise coordinates like `move_to([x, y, 0])`.\n"
+                f"{rules}\n"
+                "Write ONLY the pure Python code."
             )
-            
+                    
             prompt = f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{enhanced_instruction}\n\n### Response:\n```python\n{prefill_code}"
             
-            process_and_render(prompt, safe_topic_name, quality, keep_code, prefill_code, use_voice=True)
+            process_and_render(prompt, safe_topic_name, quality, keep_code, prefill_code, use_voice=True, rules_used=rules)
 
 if __name__ == "__main__":
     app()
