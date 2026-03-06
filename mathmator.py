@@ -38,7 +38,7 @@ LORA_ZIP_URL = "https://huggingface.co/Alisaadmotar/Mathmator-Llama3-LoRA/blob/m
 
 MERGED_MODEL_PATH = "./Mathmator-Model-Q4.gguf"
 MERGED_MODEL_ZIP_PATH = "./Mathmator-Model.gguf.zip"
-MERGED_MODEL_ZIP_URL = "https://huggingface.co/YOUR_USERNAME/YOUR_REPO_NAME/resolve/main/Mathmator-Model.gguf.zip"
+MERGED_MODEL_ZIP_URL = "https://huggingface.co/Alisaadmotar/Mathmator-Model-Q4/blob/main/Mathmator-Model-Q4.gguf.zip"
 
 LATEST_CODE_FILE = "latest_mathmator_code.py"
 LAST_ERROR_LOG = ""  # Memory for the last crash
