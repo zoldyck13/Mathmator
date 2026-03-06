@@ -114,14 +114,14 @@ if has_gpu:
     typer.secho("🤖 Mathmator: GPU Detected! 🚀 (Using Base + LoRA with mmap=False to prevent Segfault)", fg=typer.colors.GREEN, bold=True)
     gpu_layers = -1
     use_mmap = False      
-    max_tokens_val = 1800 
-    ctx_size = 2048
+    max_tokens_val = 3000 
+    ctx_size = 4096
 else:
     typer.secho("🤖 Mathmator: CPU Detected! 🐢 (Using Base + LoRA with mmap=True to save RAM)", fg=typer.colors.YELLOW, bold=True)
     gpu_layers = 0
     use_mmap = True       
-    max_tokens_val = 900  
-    ctx_size = 1024
+    max_tokens_val = 2048  
+    ctx_size = 4096
 
 llm_kwargs = {
     "model_path": BASE_MODEL_PATH,
@@ -249,6 +249,39 @@ def explain_error_speech(error_log: str) -> str:
     except Exception:
         return "It seems there is a syntax error in the code. Would you like me to try and fix it?"
 
+def generate_storyboard(command: str, use_voiceover: bool) -> str:
+    typer.secho("\n🎬 [Director Agent] Planning the cinematic storyboard...", fg=typer.colors.MAGENTA, bold=True)
+    
+    voice_instruction = "Include a specific, engaging 'Voiceover:' script for each step." if use_voiceover else "Do NOT include voiceover scripts. This is a silent visual."
+    
+    planner_prompt = (
+        "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n"
+        f"You are an elite mathematical art director like 3Blue1Brown. The user wants a Manim animation about: '{command}'.\n"
+        "Create a brilliant, step-by-step visual storyboard. DO NOT write any Python code.\n"
+        "Follow these rules:\n"
+        "1. Break the animation into 3 to 4 distinct, highly dynamic visual steps.\n"
+        "2. Focus heavily on geometric transformations, moving dots, graphs, and visual metaphors instead of just text.\n"
+        "3. NO CLICHES. Do not start with 'Welcome to...'.\n"
+        f"4. {voice_instruction}\n\n"
+        "### Response:\nStoryboard:\nStep 1:"
+    )
+    
+    try:
+        output = llm(
+            planner_prompt,
+            max_tokens=350,
+            stop=["```", "###", "<|end_of_text|>", "<|eot_id|>"],
+            temperature=0.6, # إبداع أعلى للمخرج
+            echo=False
+        )
+        storyboard = "Step 1:" + output["choices"][0]["text"].strip()
+        typer.secho(f"\n{storyboard}\n", fg=typer.colors.CYAN)
+        return storyboard
+    except Exception as e:
+        typer.secho(f"Director failed: {e}. Falling back to default prompt.", fg=typer.colors.RED)
+        return command # Fallback
+
 def process_and_render(prompt_text: str, safe_topic_name: str, quality: Quality, keep_code: bool, prefill: str, use_voice: bool = False, max_retries: int = 2, rules_used: str = MANIM_RULES):
     global LAST_ERROR_LOG
     temp_file = f"{safe_topic_name}_scene.py"
@@ -294,6 +327,11 @@ def process_and_render(prompt_text: str, safe_topic_name: str, quality: Quality,
 
             manim_code = re.sub(r'UpdateFromFunc\s*\(\s*lambda\s+[a-zA-Z0-9_]+\s*:\s*[a-zA-Z0-9_]+\.(.*?)\s*,\s*([a-zA-Z0-9_]+).*?\)', r'\2.animate.\1', manim_code)
             manim_code = re.sub(r'MoveToTarget\s*\(\s*([^,]+)\s*,\s*(\[.*?\])\s*\)', r'\1.animate.move_to(\2)', manim_code)
+            def heal_oscillation(match):
+                mob_name = match.group(1)
+                return f"{mob_name}.add_updater(lambda m, dt: m.shift(UP * np.sin(self.renderer.time) * 0.05))"
+            manim_code = re.sub(r'([a-zA-Z0-9_]+)\.begin_oscillation\(.*?\)', heal_oscillation, manim_code)
+            manim_code = re.sub(r'([a-zA-Z0-9_]+)\.start_oscillation\(.*?\)', heal_oscillation, manim_code)
             manim_code = re.sub(r'\bCYAN\b', 'TEAL', manim_code)
             manim_code = re.sub(r'\bMAGENTA\b', 'PURPLE', manim_code)
             manim_code = re.sub(r'\bBROWN\b', 'MAROON', manim_code)
@@ -517,13 +555,17 @@ def animate(topic: str = typer.Argument(...),
         )
         rules = MANIM_RULES
     
+    # 1. Call the Director Agent
+    storyboard = generate_storyboard(topic, voiceover)
+    
+    # 2. Instruct the Programmer Agent
     enhanced_instruction = (
-        f"Generate highly professional Manim CE Python code for: '{topic}'.\n"
+        f"Generate highly professional Manim CE Python code strictly following this storyboard:\n\n{storyboard}\n\n"
         "CRITICAL DIRECTIVES: YOU MUST OBEY THESE RULES OR THE CODE WILL BE REJECTED.\n"
-        "1. ZERO CLICHES: DO NOT write 'Welcome to...', 'Introduction', or 'Conclusion'. NO paragraphs of text.\n"
-        "2. VISUAL MATHEMATICS ONLY: Your scene MUST consist of Axes, geometric shapes, dynamic lines, dots tracing paths, and MathTex formulas. Focus 100% on the geometric and mathematical visualization.\n"
-        "3. PROHIBIT LONG TEXT: NEVER use `Text()` for sentences. Only use `Text()` for short 1-3 word labels.\n"
-        "4. DYNAMIC ANIMATIONS: If rendering a sine wave, DO NOT just plot it instantly. You MUST animate a Dot moving along the curve, or animate the axes drawing first, then the curve drawing from left to right using `Create(graph, run_time=3)`.\n"
+        "1. TRANSLATE PLAN TO CODE: Turn each step of the storyboard into beautiful, sequential Manim code.\n"
+        "2. ZERO CLICHES: NO paragraphs of text. NO 'Welcome to' text on screen.\n"
+        "3. VISUAL MATHEMATICS ONLY: Your scene MUST consist of Axes, geometric shapes, dynamic lines, dots tracing paths, and MathTex formulas.\n"
+        "4. PROHIBIT LONG TEXT: NEVER use `Text()` for sentences. Only use `Text()` for short 1-3 word labels.\n"
         "5. LAYOUT: Prevent overlapping. Use `.to_edge(UP)` or precise coordinates like `move_to([x, y, 0])`.\n"
         f"{rules}\n"
         "Write ONLY the pure Python code."
@@ -706,13 +748,17 @@ def voice(quality: Quality = typer.Option(Quality.low, "--quality", "-q"),
                 )
                 rules = MANIM_RULES
             
+            # 1. Call the Director Agent
+            storyboard = generate_storyboard(command, voiceover)
+            
+            # 2. Instruct the Programmer Agent
             enhanced_instruction = (
-                f"Generate highly professional Manim CE Python code for: '{command}'.\n"
+                f"Generate highly professional Manim CE Python code strictly following this storyboard:\n\n{storyboard}\n\n"
                 "CRITICAL DIRECTIVES: YOU MUST OBEY THESE RULES OR THE CODE WILL BE REJECTED.\n"
-                "1. ZERO CLICHES: DO NOT write 'Welcome to...', 'Introduction', or 'Conclusion'. NO paragraphs of text.\n"
-                "2. VISUAL MATHEMATICS ONLY: Your scene MUST consist of Axes, geometric shapes, dynamic lines, dots tracing paths, and MathTex formulas. Focus 100% on the geometric and mathematical visualization.\n"
-                "3. PROHIBIT LONG TEXT: NEVER use `Text()` for sentences. Only use `Text()` for short 1-3 word labels.\n"
-                "4. DYNAMIC ANIMATIONS: If rendering a sine wave, DO NOT just plot it instantly. You MUST animate a Dot moving along the curve, or animate the axes drawing first, then the curve drawing from left to right using `Create(graph, run_time=3)`.\n"
+                "1. TRANSLATE PLAN TO CODE: Turn each step of the storyboard into beautiful, sequential Manim code.\n"
+                "2. ZERO CLICHES: NO paragraphs of text. NO 'Welcome to' text on screen.\n"
+                "3. VISUAL MATHEMATICS ONLY: Your scene MUST consist of Axes, geometric shapes, dynamic lines, dots tracing paths, and MathTex formulas.\n"
+                "4. PROHIBIT LONG TEXT: NEVER use `Text()` for sentences. Only use `Text()` for short 1-3 word labels.\n"
                 "5. LAYOUT: Prevent overlapping. Use `.to_edge(UP)` or precise coordinates like `move_to([x, y, 0])`.\n"
                 f"{rules}\n"
                 "Write ONLY the pure Python code."
